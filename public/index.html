@@ -1,0 +1,71 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f7f8">
+  <title>Lead finder</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand-mark" aria-hidden="true">P</div>
+      <span>Project Pulse</span>
+      <span class="topbar-note">Lead finder</span>
+    </header>
+
+    <section class="intro">
+      <p class="eyebrow">LEAD RESEARCH</p>
+      <h1>Find your next lead.</h1>
+      <p class="intro-copy">Search recent project requests across X and Freelancer.com.</p>
+    </section>
+
+    <section class="freelancer-panel" aria-labelledby="freelancer-heading">
+      <div class="section-head freelancer-head">
+        <div>
+          <h2 id="freelancer-heading">Freelancer.com</h2>
+          <p>Choose campaigns and budget filters · last 3 days</p>
+        </div>
+      </div>
+      <div id="freelancer-campaigns" class="campaign-grid"><p class="loading">Loading campaigns…</p></div>
+      <div class="budget-row">
+        <label>Currency
+          <select id="freelancer-currency"><option value="USD">USD</option><option value="INR">INR</option></select>
+        </label>
+        <label>Min budget
+          <input id="freelancer-min" type="number" min="0" step="any" inputmode="decimal" placeholder="No minimum">
+        </label>
+        <label>Max budget
+          <input id="freelancer-max" type="number" min="0" step="any" inputmode="decimal" placeholder="No maximum">
+        </label>
+        <button id="freelancer-run" class="run-button" type="button" disabled>Run campaigns</button>
+      </div>
+      <p class="filter-note">Budget range checks project budgets in the selected currency; only USD or INR listings are included.</p>
+      <p id="freelancer-status" class="run-status" aria-live="polite"></p>
+    </section>
+
+    <section class="section-head">
+      <div>
+        <h2>X / Twitter</h2>
+        <p>Top results · last 3 days</p>
+      </div>
+      <span class="live-label"><span></span> Ready</span>
+    </section>
+
+    <section id="scripts" class="script-list" aria-label="Available searches">
+      <div class="loading">Loading searches…</div>
+    </section>
+
+    <section class="recent-section" id="recent-section" hidden>
+      <div class="section-head recent-head"><div><h2>Recent runs</h2><p>Run status stays here if you refresh.</p></div></div>
+      <div id="recent-runs" class="recent-list"></div>
+    </section>
+
+    <footer>Results and Excel downloads are kept for 5 minutes after a run finishes.</footer>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
+
