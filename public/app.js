@@ -37,20 +37,26 @@ function runStatus(run) {
   if (run.status === 'queued') return { text: 'Starting…', className: '' };
   if (run.status === 'running') {
     const detail = run.total ? ` · ${run.processed} of ${run.total}` : '';
-    return { text: `${run.stage}${detail}`, className: '' };
+    const leads = run.leadsFound ? ` · ${run.leadsFound} leads saved` : '';
+    return { text: `${run.stage}${detail}${leads}`, className: '' };
   }
-  if (run.status === 'completed') {
+  if (run.status === 'completed' || run.status === 'stopped') {
     const leads = run.result?.leadsFound ?? 0;
     const notes = [];
     const itemName = run.script === 'freelancer' ? 'projects' : 'tweets';
     if (run.result?.analysisErrors) notes.push(`${run.result.analysisErrors} ${itemName} skipped`);
     if (run.result?.searchErrors) notes.push(`${run.result.searchErrors} searches partial`);
+    if (run.result?.rateLimited) notes.push('Groq rate limit after retries');
+    if (run.result?.partialReason && run.status !== 'stopped' && !run.result?.rateLimited) notes.push('some processing was interrupted');
+    if (run.result?.email?.error) notes.push('email could not be sent');
     const searchDetail = run.result?.searchErrorDetails?.[0];
     if (searchDetail) notes.push(searchDetail.slice(0, 120));
     const warning = notes.length ? ` · ${notes.join(', ')}` : '';
     const checked = run.script === 'freelancer' && Number.isFinite(run.result?.projectsAnalyzed)
       ? ` · ${run.result.projectsAnalyzed} projects checked` : '';
-    return { text: `Excel ready · ${leads} ${leads === 1 ? 'lead' : 'leads'}${checked}${warning} · link expires in ${formatRemaining(run.expiresAt)}`, className: 'success' };
+    const stopped = run.status === 'stopped' ? 'Stopped · partial Excel ready' : run.result?.rateLimited ? 'Rate limit · partial Excel ready' : run.result?.partialReason ? 'Partial Excel ready' : 'Excel ready';
+    const email = run.result?.email?.sent ? ' · emailed' : '';
+    return { text: `${stopped} · ${leads} ${leads === 1 ? 'lead' : 'leads'}${checked}${warning}${email} · link expires in ${formatRemaining(run.expiresAt)}`, className: 'success' };
   }
   return { text: run.error || 'This run could not finish. Try again.', className: 'error' };
 }
@@ -101,11 +107,14 @@ function renderScripts() {
     if (status.textContent) info.append(status);
     const button = document.createElement('button');
     button.className = 'run-button'; button.type = 'button';
-    button.textContent = script.running ? 'Running…' : run?.status === 'failed' ? 'Try again' : anyRunning ? 'Wait' : 'Run';
-    button.disabled = script.running || anyRunning || Boolean(script.retryAt && script.retryAt > Date.now());
-    button.addEventListener('click', () => startRun(script.id, button));
-    if (run?.status === 'completed' && run.downloadUrl) card.append(info, makeDownloadLink(run));
-    else card.append(info, button);
+    button.textContent = script.running ? (script.activeRun?.stopRequested ? 'Stopping…' : 'Stop') : run?.status === 'failed' ? 'Try again' : anyRunning ? 'Wait' : 'Run';
+    button.disabled = (script.running && Boolean(script.activeRun?.stopRequested)) || (!script.running && (anyRunning || Boolean(script.retryAt && script.retryAt > Date.now())));
+    button.classList.toggle('stop-button', script.running);
+    button.addEventListener('click', () => script.running ? stopRun(script.activeRun, button) : startRun(script.id, button));
+    card.append(info);
+    if (script.running) card.append(button);
+    if (run?.downloadUrl) card.append(makeDownloadLink(run));
+    if (!script.running && !run?.downloadUrl) card.append(button);
     scriptList.append(card);
   }
 }
@@ -126,8 +135,10 @@ function renderFreelancer() {
   }
   const hasSelection = freelancerCampaignList.querySelector('input:checked');
   const coolingDown = Boolean(script?.retryAt && script.retryAt > Date.now());
-  freelancerButton.disabled = !freelancerCampaignsLoaded || !hasSelection || anyRunning || coolingDown;
-  freelancerButton.textContent = script?.running ? 'Running…' : coolingDown ? 'Cooling down' : run?.status === 'failed' ? 'Try again' : 'Run campaigns';
+  const stopping = Boolean(script?.activeRun?.stopRequested);
+  freelancerButton.disabled = stopping || (!script?.running && (!freelancerCampaignsLoaded || !hasSelection || anyRunning || coolingDown));
+  freelancerButton.textContent = script?.running ? stopping ? 'Stopping…' : 'Stop campaign' : coolingDown ? 'Cooling down' : run?.status === 'failed' ? 'Try again' : 'Run campaigns';
+  freelancerButton.classList.toggle('stop-button', Boolean(script?.running));
 }
 async function loadFreelancerCampaigns() {
   try {
@@ -162,7 +173,7 @@ function renderRecent() {
     const detail = document.createElement('p'); detail.className = 'recent-detail';
     detail.textContent = runStatus(run).text;
     info.append(title, detail); card.append(info);
-    if (run.status === 'completed' && run.downloadUrl) card.append(makeDownloadLink(run, true));
+    if (run.downloadUrl) card.append(makeDownloadLink(run, true));
     recentRuns.append(card);
   }
 }
@@ -176,8 +187,8 @@ async function refresh() {
     const nextRuns = await runResponse.json();
     const known = readIds(knownKey); const notified = readIds(notifiedKey);
     for (const run of nextRuns) {
-      if (known.has(run.id) && run.status === 'completed' && !notified.has(run.id)) {
-        showToast(`Excel is ready for ${run.title}. Download it before the link expires.`);
+      if (known.has(run.id) && ['completed', 'stopped'].includes(run.status) && !notified.has(run.id)) {
+        showToast(`${run.status === 'stopped' ? 'Partial Excel is ready' : 'Excel is ready'} for ${run.title}.`);
         notified.add(run.id);
       }
     }
@@ -220,7 +231,23 @@ async function startRun(scriptId, button, options = {}) {
     button.disabled = false; button.textContent = 'Try again';
   }
 }
+async function stopRun(run, button) {
+  if (!run?.id) return;
+  button.disabled = true; button.textContent = 'Stopping…';
+  try {
+    const response = await fetch(`/api/runs/${run.id}/stop`, { method: 'POST' });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || 'Could not stop this run.');
+    showToast('Stop requested. The current request will finish, then the saved Excel will be available.');
+    await refresh();
+  } catch (error) {
+    showToast(error.message === 'Failed to fetch' ? 'Can’t reach the server. Check the connection.' : error.message);
+    button.disabled = false;
+  }
+}
 freelancerButton.addEventListener('click', () => {
+  const active = scripts.find(item => item.id === 'freelancer')?.activeRun;
+  if (active) { stopRun(active, freelancerButton); return; }
   const campaigns = [...freelancerCampaignList.querySelectorAll('input:checked')].map(input => input.value);
   const rawMin = document.querySelector('#freelancer-min').value.trim();
   const rawMax = document.querySelector('#freelancer-max').value.trim();

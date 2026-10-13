@@ -287,6 +287,17 @@ h1 {
   background: var(--soft-green);
 }
 
+.run-button.stop-button {
+  color: #8b3b31;
+  border-color: #efd4cf;
+  background: #fff7f5;
+}
+
+.run-button.stop-button:hover:not(:disabled) {
+  border-color: #dfaaa1;
+  background: #fff0ed;
+}
+
 .run-button:disabled {
   color: #87918b;
   background: #f3f4f4;

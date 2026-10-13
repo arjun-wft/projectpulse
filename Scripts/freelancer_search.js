@@ -14,6 +14,13 @@ const PAGE_SIZE = 50;
 const MAX_PAGES = 3;
 const WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function sleepOrStop(ms, shouldStop) {
+  return new Promise(resolve => {
+    const until = Date.now() + ms;
+    const tick = () => shouldStop?.() || Date.now() >= until ? resolve() : setTimeout(tick, Math.min(500, until - Date.now()));
+    tick();
+  });
+}
 
 function normalizeProject(project, matchedCampaign, keyword) {
   const submitted = Number(project.time_submitted);
@@ -44,7 +51,7 @@ function normalizeProject(project, matchedCampaign, keyword) {
   };
 }
 
-async function fetchPage(keyword, offset, onRetry = () => {}) {
+async function fetchPage(keyword, offset, onRetry = () => {}, shouldStop = () => false) {
   const url = new URL(BASE_URL);
   url.search = new URLSearchParams({
     query: keyword,
@@ -55,6 +62,7 @@ async function fetchPage(keyword, offset, onRetry = () => {}) {
   });
 
   for (let attempt = 0; attempt <= 3; attempt++) {
+    if (shouldStop()) return [];
     try {
       const response = await fetch(url, {
         headers: { Accept: 'application/json' },
@@ -67,7 +75,8 @@ async function fetchPage(keyword, offset, onRetry = () => {}) {
           : Math.min(10_000 * (2 ** attempt), 60_000);
         await response.arrayBuffer().catch(() => {});
         onRetry({ keyword, attempt: attempt + 1, waitSeconds: Math.ceil(waitMs / 1000) });
-        await sleep(waitMs);
+        await sleepOrStop(waitMs, shouldStop);
+        if (shouldStop()) return [];
         continue;
       }
       if (!response.ok) {
@@ -86,7 +95,7 @@ async function fetchPage(keyword, offset, onRetry = () => {}) {
   return [];
 }
 
-async function searchFreelancer(campaignIds, onProgress = () => {}) {
+async function searchFreelancer(campaignIds, onProgress = () => {}, shouldStop = () => false) {
   const selected = CAMPAIGNS.filter(campaign => campaignIds.includes(campaign.id));
   if (!selected.length) throw new Error('Choose at least one Freelancer.com campaign.');
   const cutoff = Date.now() - WINDOW_MS;
@@ -97,19 +106,22 @@ async function searchFreelancer(campaignIds, onProgress = () => {}) {
 
   searchLoop: for (const campaign of selected) {
     for (const keyword of campaign.keywords) {
+      if (shouldStop()) break searchLoop;
       let pages = 0;
       let fetched = 0;
       let stopped = 'max pages';
       let error = null;
       for (let page = 0; page < MAX_PAGES; page++) {
+        if (shouldStop()) { stopped = 'stopped by user'; break; }
         try {
           const items = await fetchPage(keyword, page * PAGE_SIZE, retry => onProgress({
             stage: `Rate limited · retrying ${retry.keyword} in ${retry.waitSeconds}s`,
             processed: completedSearches,
             total: totalSearches,
-          }));
+          }), shouldStop);
           pages++;
           fetched += items.length;
+          if (shouldStop()) { stopped = 'stopped by user'; break; }
           if (!items.length) { stopped = 'no more results'; break; }
           let addedOnPage = 0;
           let oldestOnPage = Infinity;
@@ -141,6 +153,7 @@ async function searchFreelancer(campaignIds, onProgress = () => {}) {
       completedSearches++;
       log.push({ campaign: campaign.id, keyword, pages, fetched, inWindow: [...projects.values()].filter(p => p.matchedKeywords.includes(keyword)).length, stopped, error });
       onProgress({ stage: 'Searching Freelancer.com', processed: completedSearches, total: totalSearches });
+      if (shouldStop()) break searchLoop;
       if (/HTTP 429/.test(error || '')) break searchLoop;
       await sleep(800);
     }

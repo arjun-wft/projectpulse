@@ -24,20 +24,40 @@ const ROLES = {
       '"Flutter developer" OR "Flutter dev" OR "Flutter engineer" OR "mobile app developer" OR "cross-platform app developer" OR "Android app developer" OR "iOS app developer"',
     ],
   },
+  seo_specialist: {
+    title: 'SEO & technical SEO',
+    groups: ['"SEO specialist" OR "SEO expert" OR "SEO consultant" OR "technical SEO" OR "local SEO expert" OR "SEO audit" OR "SEO services"'],
+  },
+  google_ads_ppc: {
+    title: 'Google Ads & PPC',
+    groups: ['"Google Ads specialist" OR "Google Ads expert" OR "PPC specialist" OR "PPC expert" OR "paid ads specialist" OR "Facebook ads expert" OR "Meta ads specialist"'],
+  },
+  digital_marketing: {
+    title: 'Digital marketing',
+    groups: ['"digital marketing expert" OR "digital marketing specialist" OR "marketing consultant" OR "social media manager" OR "social media marketing" OR "content marketing" OR "email marketing" OR "email marketer"'],
+  },
 };
 
-const INTENT = '("looking for" OR "need a" OR "need an" OR "seeking a" OR "looking to hire" OR "hiring a")';
+const INTENT = '("looking for" OR "need a" OR "need an" OR "seeking a" OR "looking to hire" OR "hiring a" OR "need help with" OR "can anyone recommend" OR "recommend a")';
 const EXCLUDE = ' -"looking to connect" -"#connect" -"@grok" -"join our team" -"for hire" -"hire me" -"open to work" -"available for" -"#hiring" -"full-time" -"full time" -"internship" -is:retweet lang:en';
 const BASE_URL = 'https://api.twitterapi.io/twitter/tweet/advanced_search';
 const MAX_PAGES = 3;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function sleepOrStop(ms, shouldStop) {
+  return new Promise(resolve => {
+    const until = Date.now() + ms;
+    const tick = () => shouldStop?.() || Date.now() >= until ? resolve() : setTimeout(tick, Math.min(500, until - Date.now()));
+    tick();
+  });
+}
 
-async function getPage(apiKey, query, cursor) {
+async function getPage(apiKey, query, cursor, shouldStop = () => false) {
   const url = new URL(BASE_URL);
   url.searchParams.set('query', query);
   url.searchParams.set('queryType', 'Top');
   if (cursor) url.searchParams.set('cursor', cursor);
   for (let attempt = 0; attempt <= 3; attempt++) {
+    if (shouldStop()) return null;
     const response = await fetch(url, {
       headers: { 'X-API-Key': apiKey, Accept: 'application/json' },
       signal: AbortSignal.timeout(30_000),
@@ -46,7 +66,8 @@ async function getPage(apiKey, query, cursor) {
       const retryAfter = Number(response.headers.get('retry-after'));
       const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, 60_000) : 10_000 * (2 ** attempt);
       await response.arrayBuffer().catch(() => {});
-      await sleep(waitMs);
+      await sleepOrStop(waitMs, shouldStop);
+      if (shouldStop()) return null;
       continue;
     }
     if (!response.ok) {
@@ -58,14 +79,16 @@ async function getPage(apiKey, query, cursor) {
   throw new Error('TwitterAPI.io retries exhausted.');
 }
 
-async function searchGroup(apiKey, query) {
+async function searchGroup(apiKey, query, shouldStop = () => false) {
   const tweets = new Map();
   const pages = [];
   let cursor = null;
   let error = null;
   try {
     for (let pageNumber = 1; pageNumber <= MAX_PAGES; pageNumber++) {
-      const page = await getPage(apiKey, query, cursor);
+      if (shouldStop()) break;
+      const page = await getPage(apiKey, query, cursor, shouldStop);
+      if (!page) break;
       if (!Array.isArray(page?.tweets)) throw new Error('TwitterAPI.io response did not include tweets.');
       pages.push(page);
       for (const tweet of page.tweets) {
@@ -86,7 +109,7 @@ async function searchGroup(apiKey, query) {
   return { tweets: [...tweets.values()], pages, error };
 }
 
-async function searchTwitter(roleId, apiKey, onProgress = () => {}) {
+async function searchTwitter(roleId, apiKey, onProgress = () => {}, shouldStop = () => false) {
   const role = ROLES[roleId];
   if (!role) throw new Error('Unknown X search role.');
   if (!apiKey) throw new Error('TWITTER_API_KEY is missing.');
@@ -95,10 +118,12 @@ async function searchTwitter(roleId, apiKey, onProgress = () => {}) {
   const allTweets = new Map();
   const log = [];
   for (let index = 0; index < queries.length; index++) {
-    const result = await searchGroup(apiKey, queries[index]);
+    if (shouldStop()) break;
+    const result = await searchGroup(apiKey, queries[index], shouldStop);
     for (const tweet of result.tweets) allTweets.set(tweet.id, tweet);
     log.push({ group: index + 1, query: queries[index], pages: result.pages.length, count: result.tweets.length, error: result.error });
     onProgress({ stage: 'Searching X / Twitter', processed: index + 1, total: queries.length });
+    if (shouldStop()) break;
     if (/HTTP 429/.test(result.error || '')) break;
     if (index < queries.length - 1) await sleep(2000);
   }
