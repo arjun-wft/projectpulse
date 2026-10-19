@@ -1,10 +1,14 @@
-﻿const scriptList = document.querySelector('#scripts');
+const scriptList = document.querySelector('#scripts');
 const recentSection = document.querySelector('#recent-section');
 const recentRuns = document.querySelector('#recent-runs');
 const toast = document.querySelector('#toast');
 const freelancerCampaignList = document.querySelector('#freelancer-campaigns');
 const freelancerButton = document.querySelector('#freelancer-run');
 const freelancerStatus = document.querySelector('#freelancer-status');
+const freelancerDownloads = document.querySelector('#freelancer-downloads');
+const userNav = document.querySelector('#user-nav');
+const userEmail = document.querySelector('#user-email');
+const logoutBtn = document.querySelector('#logout-btn');
 const knownKey = 'pulse-known-run-ids';
 const notifiedKey = 'pulse-notified-run-ids';
 let scripts = [];
@@ -15,6 +19,37 @@ let offline = false;
 let freelancerCampaigns = [];
 let freelancerCampaignsLoaded = false;
 let pollTimer = null;
+
+async function checkAuth() {
+  try {
+    const response = await fetch('/api/auth/me');
+    if (!response.ok) { window.location.href = '/login'; return false; }
+    const data = await response.json().catch(() => ({}));
+    if (!data.authenticated) {
+      window.location.href = '/login';
+      return false;
+    }
+    if (userNav && userEmail) {
+      userEmail.textContent = data.email || 'Admin';
+      userNav.hidden = false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+if (logoutBtn) {
+  logoutBtn.addEventListener('click', async () => {
+    logoutBtn.disabled = true;
+    logoutBtn.textContent = 'Signing out…';
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch {}
+    window.location.href = '/login';
+  });
+}
+
 
 function readIds(key) {
   try { return new Set(JSON.parse(localStorage.getItem(key) || '[]')); } catch { return new Set(); }
@@ -61,25 +96,37 @@ function runStatus(run) {
   return { text: run.error || 'This run could not finish. Try again.', className: 'error' };
 }
 function latestRun(scriptId) { return runs.find(run => run.script === scriptId); }
-function makeDownloadLink(run, compact = false) {
+function makeDownloadLink(run, type = 'ai', compact = false) {
+  const isRaw = type === 'raw';
+  const url = isRaw ? run.rawDownloadUrl : run.downloadUrl;
+  const fileName = isRaw ? (run.rawFileName || 'all_candidates.xlsx') : (run.fileName || 'leads.xlsx');
   const link = document.createElement('a');
-  link.className = 'download-button'; link.href = run.downloadUrl;
-  link.textContent = compact ? 'Download' : 'Download Excel';
-  link.setAttribute('download', run.fileName || 'leads.xlsx');
-  link.addEventListener('click', event => { event.preventDefault(); downloadRun(run); });
+  link.className = `download-button ${isRaw ? 'secondary' : 'primary'}`;
+  link.href = url;
+  if (compact) {
+    link.textContent = isRaw ? 'All data' : 'AI leads';
+  } else {
+    link.textContent = isRaw ? 'Download all data' : 'Download AI leads';
+  }
+  link.setAttribute('download', fileName);
+  link.addEventListener('click', event => {
+    event.preventDefault();
+    downloadFile(url, fileName);
+  });
   return link;
 }
-async function downloadRun(run) {
+async function downloadFile(url, fileName) {
+  if (!url) return;
   try {
-    const response = await fetch(run.downloadUrl);
+    const response = await fetch(url);
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
-      throw new Error(body.error || 'This Excel link expired. Run the search again.');
+      throw new Error(body.error || 'This file link expired. Run the search again.');
     }
     const file = await response.blob();
     const objectUrl = URL.createObjectURL(file);
     const link = document.createElement('a');
-    link.href = objectUrl; link.download = run.fileName || 'leads.xlsx';
+    link.href = objectUrl; link.download = fileName;
     document.body.append(link); link.click(); link.remove();
     setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
   } catch (error) {
@@ -112,9 +159,14 @@ function renderScripts() {
     button.classList.toggle('stop-button', script.running);
     button.addEventListener('click', () => script.running ? stopRun(script.activeRun, button) : startRun(script.id, button));
     card.append(info);
-    if (script.running) card.append(button);
-    if (run?.downloadUrl) card.append(makeDownloadLink(run));
-    if (!script.running && !run?.downloadUrl) card.append(button);
+
+    const actions = document.createElement('div');
+    actions.className = 'script-actions';
+    if (run?.rawDownloadUrl) actions.append(makeDownloadLink(run, 'raw'));
+    if (run?.downloadUrl) actions.append(makeDownloadLink(run, 'ai'));
+    actions.append(button);
+    card.append(actions);
+
     scriptList.append(card);
   }
 }
@@ -139,10 +191,17 @@ function renderFreelancer() {
   freelancerButton.disabled = stopping || (!script?.running && (!freelancerCampaignsLoaded || !hasSelection || anyRunning || coolingDown));
   freelancerButton.textContent = script?.running ? stopping ? 'Stopping…' : 'Stop campaign' : coolingDown ? 'Cooling down' : run?.status === 'failed' ? 'Try again' : 'Run campaigns';
   freelancerButton.classList.toggle('stop-button', Boolean(script?.running));
+
+  if (freelancerDownloads) {
+    freelancerDownloads.replaceChildren();
+    if (run?.rawDownloadUrl) freelancerDownloads.append(makeDownloadLink(run, 'raw'));
+    if (run?.downloadUrl) freelancerDownloads.append(makeDownloadLink(run, 'ai'));
+  }
 }
 async function loadFreelancerCampaigns() {
   try {
     const response = await fetch('/api/freelancer/campaigns');
+    if (response.status === 401) { window.location.href = '/login'; return; }
     if (!response.ok) throw new Error('Could not load Freelancer.com campaigns.');
     freelancerCampaigns = await response.json();
     freelancerCampaignList.replaceChildren();
@@ -173,7 +232,11 @@ function renderRecent() {
     const detail = document.createElement('p'); detail.className = 'recent-detail';
     detail.textContent = runStatus(run).text;
     info.append(title, detail); card.append(info);
-    if (run.downloadUrl) card.append(makeDownloadLink(run, true));
+    const actions = document.createElement('div');
+    actions.className = 'recent-actions';
+    if (run.rawDownloadUrl) actions.append(makeDownloadLink(run, 'raw', true));
+    if (run.downloadUrl) actions.append(makeDownloadLink(run, 'ai', true));
+    if (actions.children.length > 0) card.append(actions);
     recentRuns.append(card);
   }
 }
@@ -182,6 +245,10 @@ async function refresh() {
   refreshing = true;
   try {
     const [scriptResponse, runResponse] = await Promise.all([fetch('/api/scripts'), fetch('/api/runs')]);
+    if (scriptResponse.status === 401 || runResponse.status === 401) {
+      window.location.href = '/login';
+      return;
+    }
     if (!scriptResponse.ok || !runResponse.ok) throw new Error('Could not refresh run status.');
     scripts = await scriptResponse.json();
     const nextRuns = await runResponse.json();
@@ -263,9 +330,14 @@ freelancerButton.addEventListener('click', () => {
     maxBudget,
   });
 });
-loadFreelancerCampaigns();
-refresh().finally(schedulePoll);
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) refresh().finally(schedulePoll);
-  else schedulePoll();
+checkAuth().then(authenticated => {
+  if (authenticated) {
+    loadFreelancerCampaigns();
+    refresh().finally(schedulePoll);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) refresh().finally(schedulePoll);
+      else schedulePoll();
+    });
+  }
 });
+

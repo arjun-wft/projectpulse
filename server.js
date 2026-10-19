@@ -1,4 +1,4 @@
-﻿const http = require('node:http');
+const http = require('node:http');
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
 const path = require('node:path');
@@ -25,10 +25,10 @@ const ROOT = __dirname;
 const PORT = Number(process.env.PORT || 3000);
 const MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 const BASE_URL = (process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/+$/, '');
-const MIN_INTERVAL_MS = Math.max(0, Number(process.env.GROQ_MIN_INTERVAL_MS || 3000));
+const MIN_INTERVAL_MS = Math.max(2200, Number(process.env.GROQ_MIN_INTERVAL_MS || 2500));
 const MAX_RETRIES = 5;
 const AI_BATCH_SIZE = 3;
-const AI_MAX_RETRIES = 3;
+const AI_MAX_RETRIES = 8;
 const RUN_TTL_MS = 5 * 60 * 1000;
 const JOB_ROOT = path.join(ROOT, '.runtime', 'jobs');
 const PUBLIC_ROOT = path.join(ROOT, 'public');
@@ -49,6 +49,79 @@ const scriptLocks = new Map();
 let groqQueue = Promise.resolve();
 let lastGroqRequestAt = 0;
 
+// Authentication, Session & Login Rate Limiting State
+const sessions = new Map(); // token -> { email, createdAt, expiresAt }
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const loginAttempts = new Map(); // ip -> Array of timestamps
+const LOGIN_RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const LOGIN_RATE_LIMIT_MAX = 20; // 20 login attempts per minute
+
+function parseCookies(request) {
+  const header = request.headers.cookie;
+  if (!header) return {};
+  const cookies = {};
+  for (const item of header.split(';')) {
+    const [rawKey, ...rawVal] = item.trim().split('=');
+    if (!rawKey) continue;
+    cookies[rawKey] = decodeURIComponent(rawVal.join('='));
+  }
+  return cookies;
+}
+
+function getClientIp(request) {
+  const forwarded = request.headers['x-forwarded-for'];
+  if (forwarded) return forwarded.split(',')[0].trim();
+  return request.socket?.remoteAddress || '127.0.0.1';
+}
+
+function checkLoginRateLimit(ip) {
+  const now = Date.now();
+  const history = (loginAttempts.get(ip) || []).filter(t => now - t < LOGIN_RATE_LIMIT_WINDOW_MS);
+  if (history.length >= LOGIN_RATE_LIMIT_MAX) {
+    loginAttempts.set(ip, history);
+    const oldest = history[0];
+    const retryAfterSeconds = Math.max(1, Math.ceil((oldest + LOGIN_RATE_LIMIT_WINDOW_MS - now) / 1000));
+    return { allowed: false, retryAfterSeconds };
+  }
+  history.push(now);
+  loginAttempts.set(ip, history);
+  return { allowed: true };
+}
+
+function getSession(request) {
+  const cookies = parseCookies(request);
+  const token = cookies.pulse_session;
+  if (!token) return null;
+  const session = sessions.get(token);
+  if (!session) return null;
+  if (session.expiresAt && session.expiresAt <= Date.now()) {
+    sessions.delete(token);
+    return null;
+  }
+  return session;
+}
+
+function safeCompare(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const hashA = crypto.createHash('sha256').update(a).digest();
+  const hashB = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
+
+// Periodic cleanup of expired sessions and stale rate limiter logs
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, session] of sessions.entries()) {
+    if (session.expiresAt && session.expiresAt <= now) sessions.delete(token);
+  }
+  for (const [ip, history] of loginAttempts.entries()) {
+    const valid = history.filter(t => now - t < LOGIN_RATE_LIMIT_WINDOW_MS);
+    if (!valid.length) loginAttempts.delete(ip);
+    else loginAttempts.set(ip, valid);
+  }
+}, 5 * 60 * 1000).unref?.();
+
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 function safeText(value) { return value == null ? '' : String(value); }
 function json(response, status, body) {
@@ -56,13 +129,17 @@ function json(response, status, body) {
   response.end(JSON.stringify(body));
 }
 function publicJob(job) {
+  const isAccessible = ['queued', 'running', 'completed', 'stopped'].includes(job.status);
   return {
     id: job.id, script: job.script, title: job.title || ROLES[job.script]?.title || 'Freelancer.com', status: job.status,
     stage: job.stage, processed: job.processed, total: job.total,
     createdAt: job.createdAt, completedAt: job.completedAt, expiresAt: job.expiresAt,
     fileName: job.fileName, error: job.status === 'failed' ? job.userMessage : null, result: job.result,
     stopRequested: Boolean(job.stopRequested), partialReady: Boolean(job.partialReady), leadsFound: job.leadsFound || 0,
-    downloadUrl: job.fileName && job.partialReady && ['queued', 'running', 'completed', 'stopped'].includes(job.status) ? `/api/runs/${job.id}/download` : null,
+    downloadUrl: job.fileName && job.partialReady && isAccessible ? `/api/runs/${job.id}/download` : null,
+    rawFileName: job.rawFileName || null,
+    rawReady: Boolean(job.rawReady),
+    rawDownloadUrl: job.rawFileName && job.rawReady && isAccessible ? `/api/runs/${job.id}/download/raw` : null,
   };
 }
 function scriptsPayload() {
@@ -138,13 +215,84 @@ function analyzeTweet(role, tweet) {
   groqQueue = task.catch(() => { });
   return task;
 }
+function parseDurationMs(val) {
+  if (!val) return 0;
+  if (typeof val === 'number') return val > 0 ? val * 1000 : 0;
+  const str = String(val).trim();
+  if (/^\d+(?:\.\d+)?$/.test(str)) return Math.round(parseFloat(str) * 1000);
+  let totalMs = 0;
+  const regex = /(\d+(?:\.\d+)?)\s*(ms|h|m|s)/gi;
+  let match;
+  let matchedAny = false;
+  while ((match = regex.exec(str)) !== null) {
+    matchedAny = true;
+    const num = parseFloat(match[1]);
+    const unit = match[2].toLowerCase();
+    if (unit === 'h') totalMs += num * 3600000;
+    else if (unit === 'm') totalMs += num * 60000;
+    else if (unit === 's') totalMs += num * 1000;
+    else if (unit === 'ms') totalMs += num;
+  }
+  if (!matchedAny) {
+    const fallback = parseFloat(str);
+    if (!Number.isNaN(fallback)) return Math.round(fallback * 1000);
+  }
+  return Math.max(0, Math.round(totalMs));
+}
+
+// Live tracking of Groq API rate limits across requests
+const groqRateState = {
+  remainingTokens: 8000,
+  limitTokens: 8000,
+  resetTokensMs: 0,
+  resetTokensAt: 0,
+  remainingRequests: 30,
+  limitRequests: 30,
+  resetRequestsMs: 0,
+  resetRequestsAt: 0,
+  lastUpdated: 0,
+};
+
+function updateGroqRateLimits(headers) {
+  if (!headers || typeof headers.get !== 'function') return;
+  const now = Date.now();
+  const remTok = headers.get('x-ratelimit-remaining-tokens');
+  const limTok = headers.get('x-ratelimit-limit-tokens');
+  const rstTok = headers.get('x-ratelimit-reset-tokens');
+
+  const remReq = headers.get('x-ratelimit-remaining-requests');
+  const limReq = headers.get('x-ratelimit-limit-requests');
+  const rstReq = headers.get('x-ratelimit-reset-requests');
+
+  if (remTok !== null) groqRateState.remainingTokens = parseInt(remTok, 10);
+  if (limTok !== null) groqRateState.limitTokens = parseInt(limTok, 10);
+  if (rstTok !== null) {
+    const durMs = parseDurationMs(rstTok);
+    groqRateState.resetTokensMs = durMs;
+    groqRateState.resetTokensAt = now + durMs;
+  }
+
+  if (remReq !== null) groqRateState.remainingRequests = parseInt(remReq, 10);
+  if (limReq !== null) groqRateState.limitRequests = parseInt(limReq, 10);
+  if (rstReq !== null) {
+    const durMs = parseDurationMs(rstReq);
+    groqRateState.resetRequestsMs = durMs;
+    groqRateState.resetRequestsAt = now + durMs;
+  }
+  groqRateState.lastUpdated = now;
+}
+
 function batchPrompt(role, sourceType, records) {
   return {
-    sourceType, role, records: records.map(({ id, tweet, role: itemRole }) => ({
-      id, role: itemRole || role, record: {
-        createdAt: safeText(tweet.createdAt), user: safeText(tweet.user), text: safeText(tweet.text), link: safeText(tweet.link),
-      }
-    }))
+    sourceType, role, records: records.map(({ id, tweet, role: itemRole }) => {
+      let text = safeText(tweet.text);
+      if (text.length > 1200) text = text.slice(0, 1200) + '... [truncated]';
+      return {
+        id, role: itemRole || role, record: {
+          createdAt: safeText(tweet.createdAt), user: safeText(tweet.user), text, link: safeText(tweet.link),
+        }
+      };
+    })
   };
 }
 function isOversizedInput(error) {
@@ -161,14 +309,39 @@ function waitWithStop(ms, shouldStop) {
     tick();
   });
 }
-async function callGroqBatch(role, sourceType, records, shouldStop) {
+async function callGroqBatch(role, sourceType, records, shouldStop, onWait) {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error('GROQ_API_KEY is missing from .env');
+
+  // Minimum spacing between any Groq calls
   const spacing = MIN_INTERVAL_MS - (Date.now() - lastGroqRequestAt);
   if (spacing > 0) await waitWithStop(spacing, shouldStop);
   if (shouldStop?.()) return [];
+
+  // Proactive token buffer: if remaining tokens are critically low, pause until reset
+  const now = Date.now();
+  if (groqRateState.remainingTokens < 2000 && groqRateState.resetTokensAt > now) {
+    const tokenWait = (groqRateState.resetTokensAt - now) + 600;
+    if (tokenWait > 0) {
+      onWait?.(`Groq token buffer · waiting ${Math.ceil(tokenWait / 1000)}s for reset`);
+      await waitWithStop(tokenWait, shouldStop);
+      if (shouldStop?.()) return [];
+    }
+  }
+
+  // Proactive request limit buffer: if daily/minute requests are exhausted, pause until reset
+  if (groqRateState.remainingRequests < 1 && groqRateState.resetRequestsAt > Date.now()) {
+    const reqWait = (groqRateState.resetRequestsAt - Date.now()) + 600;
+    if (reqWait > 0 && reqWait <= 60000) {
+      onWait?.(`Groq request limit · waiting ${Math.ceil(reqWait / 1000)}s for reset`);
+      await waitWithStop(reqWait, shouldStop);
+      if (shouldStop?.()) return [];
+    }
+  }
+
   const prompt = batchPrompt(role, sourceType, records);
-  let completionTokenBudget = 4096;
+  // Conservative completion token budget: 1024 tokens is plenty for 3 JSON records while avoiding Groq's upfront TPM reservation blowing out 8k/18k limits
+  let completionTokenBudget = 1024;
   for (let attempt = 0; attempt <= AI_MAX_RETRIES; attempt++) {
     lastGroqRequestAt = Date.now();
     let response;
@@ -184,6 +357,10 @@ async function callGroqBatch(role, sourceType, records, shouldStop) {
           ]
         }),
       });
+
+      // Update rate limiter state from Groq response headers
+      updateGroqRateLimits(response.headers);
+
       if (response.ok) {
         const body = await response.json();
         const parsed = parseJson(body.choices?.[0]?.message?.content || '');
@@ -202,8 +379,17 @@ async function callGroqBatch(role, sourceType, records, shouldStop) {
       if (isOversizedInput(error)) throw Object.assign(error, { oversizedInput: true });
       if (response.status === 429 || response.status >= 500) {
         if (attempt >= AI_MAX_RETRIES) throw error;
+        let backoff = 0;
         const retryAfter = Number(response.headers.get('retry-after'));
-        const backoff = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(60000, retryAfter * 1000) : Math.min(60000, 2000 * (2 ** attempt));
+        if (Number.isFinite(retryAfter) && retryAfter > 0) backoff = retryAfter * 1000;
+        const resetTokensMs = parseDurationMs(response.headers.get('x-ratelimit-reset-tokens'));
+        if (resetTokensMs > backoff) backoff = resetTokensMs;
+        const resetReqMs = parseDurationMs(response.headers.get('x-ratelimit-reset-requests'));
+        if (resetReqMs > backoff && resetReqMs <= 60000) backoff = resetReqMs;
+
+        backoff = backoff > 0 ? backoff + 600 : Math.min(60000, 2500 * (1.5 ** attempt));
+        const waitSec = Math.ceil(backoff / 1000);
+        onWait?.(`Groq rate limit · waiting ${waitSec}s for reset (attempt ${attempt + 1}/${AI_MAX_RETRIES})`);
         await waitWithStop(backoff, shouldStop);
         if (shouldStop?.()) return [];
         continue;
@@ -220,11 +406,11 @@ async function callGroqBatch(role, sourceType, records, shouldStop) {
   }
   return [];
 }
-async function analyzeRecords(role, sourceType, records, shouldStop = () => false) {
+async function analyzeRecords(role, sourceType, records, shouldStop = () => false, onWait = null) {
   // Keep batches small; split on token limits or incomplete/malformed batch output.
   if (!records.length || shouldStop()) return [];
   try {
-    const results = await callGroqBatch(role, sourceType, records, shouldStop);
+    const results = await callGroqBatch(role, sourceType, records, shouldStop, onWait);
     const byId = new Map(results);
     const complete = records.filter(record => byId.has(record.id)).map(record => [record.id, byId.get(record.id)]);
     const missing = records.filter(record => !byId.has(record.id));
@@ -233,7 +419,7 @@ async function analyzeRecords(role, sourceType, records, shouldStop = () => fals
       const fallback = await analyzeTweetNow(role, records[0].tweet, sourceType);
       return [[records[0].id, fallback]];
     }
-    try { return [...complete, ...await analyzeRecords(role, sourceType, missing, shouldStop)]; }
+    try { return [...complete, ...await analyzeRecords(role, sourceType, missing, shouldStop, onWait)]; }
     catch (error) {
       // Keep valid records from a partly successful response if the missing IDs then hit a limit.
       error.partialResults = [...complete, ...(error.partialResults || [])];
@@ -242,8 +428,8 @@ async function analyzeRecords(role, sourceType, records, shouldStop = () => fals
   } catch (error) {
     if ((isOversizedInput(error) || /invalid JSON|did not include results|max completion tokens|json_validate_failed/i.test(error.message)) && records.length > 1) {
       const middle = Math.ceil(records.length / 2);
-      const firstHalf = await analyzeRecords(role, sourceType, records.slice(0, middle), shouldStop);
-      try { return [...firstHalf, ...await analyzeRecords(role, sourceType, records.slice(middle), shouldStop)]; }
+      const firstHalf = await analyzeRecords(role, sourceType, records.slice(0, middle), shouldStop, onWait);
+      try { return [...firstHalf, ...await analyzeRecords(role, sourceType, records.slice(middle), shouldStop, onWait)]; }
       catch (splitError) {
         splitError.partialResults = [...firstHalf, ...(splitError.partialResults || [])];
         throw splitError;
@@ -252,9 +438,9 @@ async function analyzeRecords(role, sourceType, records, shouldStop = () => fals
     if (records.length === 1 && isOversizedInput(error)) {
       const record = records[0];
       const text = safeText(record.tweet.text);
-      if (text.length > 2200) {
-        const clipped = { ...record, tweet: { ...record.tweet, text: `${text.slice(0, 2200)} [truncated to fit AI input limit]` } };
-        return await callGroqBatch(role, sourceType, [clipped], shouldStop);
+      if (text.length > 1200) {
+        const clipped = { ...record, tweet: { ...record.tweet, text: `${text.slice(0, 1200)} [truncated to fit AI input limit]` } };
+        return await callGroqBatch(role, sourceType, [clipped], shouldStop, onWait);
       }
       return [[record.id, await analyzeTweetNow(role, record.tweet, sourceType)]];
     }
@@ -269,17 +455,19 @@ async function analyzeTweetNow(role, tweet, sourceType = 'X post') {
   if (!apiKey) throw new Error('GROQ_API_KEY is missing from .env');
   const waitFor = MIN_INTERVAL_MS - (Date.now() - lastGroqRequestAt);
   if (waitFor > 0) await sleep(waitFor);
+  let text = safeText(tweet.text);
+  if (text.length > 1200) text = text.slice(0, 1200) + '... [truncated]';
   const prompt = {
     sourceType,
     role,
     tweet: {
       createdAt: safeText(tweet.createdAt),
       user: safeText(tweet.user),
-      text: safeText(tweet.text),
+      text,
       link: safeText(tweet.link),
     },
   };
-  let completionTokenBudget = 2048;
+  let completionTokenBudget = 512;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     lastGroqRequestAt = Date.now();
     try {
@@ -296,24 +484,29 @@ async function analyzeTweetNow(role, tweet, sourceType = 'X post') {
           ],
         }),
       });
+      updateGroqRateLimits(response.headers);
       if (response.ok) {
         const body = await response.json();
         return parseJson(body.choices?.[0]?.message?.content || '');
       }
       const bodyText = await response.text();
-      if (/json_validate_failed|Failed to generate JSON|max completion tokens/i.test(bodyText) && completionTokenBudget < 4096) {
-        completionTokenBudget = 4096;
+      if (/json_validate_failed|Failed to generate JSON|max completion tokens/i.test(bodyText) && completionTokenBudget < 1024) {
+        completionTokenBudget = 1024;
         await sleep(MIN_INTERVAL_MS);
         continue;
       }
       if (response.status !== 429 && response.status < 500) throw new Error(`Groq HTTP ${response.status}: ${bodyText}`);
       if (attempt === MAX_RETRIES) throw new Error(`Groq HTTP ${response.status} after retries: ${bodyText}`);
+      let backoff = 0;
       const retryAfter = Number(response.headers.get('retry-after'));
-      const backoff = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(60000, retryAfter * 1000) : Math.min(60000, 2000 * (2 ** attempt));
+      if (Number.isFinite(retryAfter) && retryAfter > 0) backoff = retryAfter * 1000;
+      const resetTokens = parseDurationMs(response.headers.get('x-ratelimit-reset-tokens'));
+      if (resetTokens > backoff) backoff = resetTokens;
+      backoff = backoff > 0 ? backoff + 600 : Math.min(60000, 2000 * (2 ** attempt));
       await sleep(backoff);
     } catch (error) {
-      if (error.message === 'Groq returned invalid JSON' && completionTokenBudget < 4096) {
-        completionTokenBudget = 4096;
+      if (error.message === 'Groq returned invalid JSON' && completionTokenBudget < 1024) {
+        completionTokenBudget = 1024;
         await sleep(MIN_INTERVAL_MS);
         continue;
       }
@@ -366,6 +559,63 @@ async function saveFreelancerWorkbook(outputDir, rows) {
   await retryBusy(() => fs.rename(tempFile, file));
   return file;
 }
+async function saveAllFreelancerWorkbook(outputDir, matchingProjects) {
+  const file = path.join(outputDir, 'all_candidates_freelancer.xlsx');
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('All Freelancer Candidates');
+  const headers = ['Project ID', 'Posted At', 'Campaigns', 'Title', 'Description', 'Project Type', 'Budget', 'Bids', 'Average Bid (USD)', 'Language', 'Project URL'];
+  sheet.addRow(headers);
+  sheet.getRow(1).font = { bold: true };
+  sheet.views = [{ state: 'frozen', ySplit: 1 }];
+  sheet.autoFilter = { from: 'A1', to: 'K1' };
+  [18, 24, 34, 42, 68, 15, 22, 12, 22, 14, 58].forEach((width, index) => { sheet.getColumn(index + 1).width = width; });
+  for (const project of matchingProjects) {
+    sheet.addRow([
+      safeText(project.id),
+      safeText(project.postedAt),
+      safeText(project.campaigns?.join(', ')),
+      safeText(project.title),
+      safeText(project.description),
+      safeText(project.projectType),
+      safeText(project.budgetOriginal),
+      project.bidCount ?? 0,
+      project.averageBid ?? '',
+      safeText(project.language),
+      safeText(project.url),
+    ]);
+  }
+  const tempFile = `${file}.${process.pid}.tmp.xlsx`;
+  await retryBusy(() => workbook.xlsx.writeFile(tempFile));
+  await retryBusy(() => fs.rename(tempFile, file));
+  return file;
+}
+async function saveAllTweetsWorkbook(roleKey, outputDir, candidates) {
+  const file = path.join(outputDir, `all_candidates_${roleKey}.xlsx`);
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('All Candidates');
+  const headers = ['Tweet ID', 'Created At', 'Username', 'Tweet Text', 'Tweet URL', 'Search Role'];
+  sheet.addRow(headers);
+  sheet.getRow(1).font = { bold: true };
+  sheet.views = [{ state: 'frozen', ySplit: 1 }];
+  sheet.autoFilter = { from: 'A1', to: 'F1' };
+  [24, 22, 22, 70, 48, 28].forEach((width, index) => { sheet.getColumn(index + 1).width = width; });
+  const roleTitle = ROLES[roleKey]?.title || roleKey;
+  for (const item of candidates) {
+    const tweet = item.tweet || item;
+    sheet.addRow([
+      safeText(tweet.id),
+      safeText(tweet.createdAt),
+      safeText(tweet.user),
+      safeText(tweet.text),
+      safeText(tweet.link),
+      roleTitle,
+    ]);
+  }
+  const tempFile = `${file}.${process.pid}.tmp.xlsx`;
+  await retryBusy(() => workbook.xlsx.writeFile(tempFile));
+  await retryBusy(() => fs.rename(tempFile, file));
+  return file;
+}
 function filterFreelancerProjects(projects, options) {
   const min = options.minBudget;
   const max = options.maxBudget;
@@ -391,6 +641,18 @@ async function runFreelancer(outputDir, onProgress, options, shouldStop) {
     throw new Error(search.log.filter(item => item.error).map(item => item.error).join('; ') || 'Freelancer.com searches failed.');
   }
 
+  let rawFile = null;
+  if (matching.length > 0) {
+    rawFile = await saveAllFreelancerWorkbook(outputDir, matching);
+    onProgress({
+      stage: 'Freelancer.com projects fetched · all candidates ready',
+      processed: 0,
+      total: matching.length,
+      rawFileName: path.basename(rawFile),
+      rawReady: true,
+    });
+  }
+
   const accepted = [];
   let analysisErrors = 0;
   let processed = 0;
@@ -406,7 +668,9 @@ async function runFreelancer(outputDir, onProgress, options, shouldStop) {
     onProgress({ stage: 'Analyzing Freelancer.com projects', processed, total: matching.length, leadsFound: accepted.length });
     let analyzedCount = 0;
     try {
-      const analyses = new Map(await analyzeRecords('Freelancer.com client project', 'Freelancer.com project listing', batch, shouldStop));
+      const analyses = new Map(await analyzeRecords('Freelancer.com client project', 'Freelancer.com project listing', batch, shouldStop, waitStage => {
+        onProgress({ stage: waitStage, processed, total: matching.length, leadsFound: accepted.length });
+      }));
       analyzedCount = analyses.size;
       for (const item of batch) {
         const analysis = analyses.get(item.id);
@@ -422,16 +686,24 @@ async function runFreelancer(outputDir, onProgress, options, shouldStop) {
         if (analysis?.potentialLead === true && analysis.intent === 'buyer_request' && Number(analysis.confidence) >= 0.55) accepted.push({ project: item.project, analysis });
       }
       console.error('[Freelancer project batch analysis failed]', batch.map(item => item.id).join(','), error);
-      if (isGroq429(error)) { rateLimited = true; break; }
+      if (isGroq429(error)) {
+        rateLimited = true;
+        await waitWithStop(4000, shouldStop);
+      }
     }
     processed += analyzedCount;
     // Atomic workbook checkpoint after every batch makes partial results downloadable.
     const file = await saveFreelancerWorkbook(outputDir, accepted);
-    onProgress({ stage: shouldStop() ? 'Stopping · partial Excel ready' : 'Analyzing Freelancer.com projects', processed, total: matching.length, leadsFound: accepted.length, fileName: path.basename(file), partialReady: true });
+    onProgress({
+      stage: shouldStop() ? 'Stopping · partial Excel ready' : 'Analyzing Freelancer.com projects',
+      processed, total: matching.length, leadsFound: accepted.length, fileName: path.basename(file), partialReady: true,
+      rawFileName: rawFile ? path.basename(rawFile) : null, rawReady: Boolean(rawFile)
+    });
   }
   const file = await saveFreelancerWorkbook(outputDir, accepted);
   return {
-    fileName: path.basename(file), projectsFound: search.projects.length, projectsAnalyzed: processed, projectsMatching: matching.length,
+    fileName: path.basename(file), rawFileName: rawFile ? path.basename(rawFile) : null,
+    projectsFound: search.projects.length, projectsAnalyzed: processed, projectsMatching: matching.length,
     leadsFound: accepted.length, analysisErrors, searchErrors: search.searchErrors, stopped: shouldStop(), rateLimited,
     searchErrorDetails: search.log.filter(item => item.error).slice(0, 3).map(item => `${item.keyword}: ${item.error}`),
   };
@@ -453,7 +725,20 @@ async function runRole(roleKey, outputDir, onProgress, options, shouldStop) {
     if (!id || seen.has(id)) return false;
     seen.add(id); return true;
   });
-  onProgress({ stage: 'Analyzing Top tweets', processed: 0, total: unique.length });
+
+  let rawFile = null;
+  if (unique.length > 0) {
+    rawFile = await saveAllTweetsWorkbook(roleKey, outputDir, unique);
+    onProgress({
+      stage: 'Top tweets fetched · all candidates ready',
+      processed: 0,
+      total: unique.length,
+      rawFileName: path.basename(rawFile),
+      rawReady: true,
+    });
+  }
+
+  onProgress({ stage: 'Analyzing Top tweets', processed: 0, total: unique.length, rawFileName: rawFile ? path.basename(rawFile) : null, rawReady: Boolean(rawFile) });
   const accepted = [];
   let analysisErrors = 0;
   let processed = 0;
@@ -462,7 +747,9 @@ async function runRole(roleKey, outputDir, onProgress, options, shouldStop) {
     const batch = unique.slice(start, start + AI_BATCH_SIZE).map((item, offset) => ({ id: safeText(item.tweet.id) || String(start + offset), ...item }));
     let analyzedCount = 0;
     try {
-      const analyses = new Map(await analyzeRecords(roleKey, 'X post', batch.map(item => ({ id: item.id, tweet: item.tweet })), shouldStop));
+      const analyses = new Map(await analyzeRecords(roleKey, 'X post', batch.map(item => ({ id: item.id, tweet: item.tweet })), shouldStop, waitStage => {
+        onProgress({ stage: waitStage, processed, total: unique.length, leadsFound: accepted.length });
+      }));
       analyzedCount = analyses.size;
       for (const item of batch) {
         const analysis = analyses.get(item.id);
@@ -477,18 +764,23 @@ async function runRole(roleKey, outputDir, onProgress, options, shouldStop) {
         if (analysis?.potentialLead === true && analysis.intent === 'buyer_request' && Number(analysis.confidence) >= 0.55) accepted.push({ ...item, analysis });
       }
       console.error('[tweet batch analysis failed]', roleKey, batch.map(item => item.id).join(','), error);
-      if (isGroq429(error)) { rateLimited = true; break; }
+      if (isGroq429(error)) {
+        rateLimited = true;
+        await waitWithStop(4000, shouldStop);
+      }
     }
     processed += analyzedCount;
     const file = await saveWorkbook(roleKey, outputDir, accepted);
     onProgress({
       stage: shouldStop() ? 'Stopping · partial Excel ready' : 'Analyzing Top tweets', processed, total: unique.length,
-      leadsFound: accepted.length, fileName: path.basename(file), partialReady: true
+      leadsFound: accepted.length, fileName: path.basename(file), partialReady: true,
+      rawFileName: rawFile ? path.basename(rawFile) : null, rawReady: Boolean(rawFile)
     });
   }
   const file = await saveWorkbook(roleKey, outputDir, accepted);
   return {
-    fileName: path.basename(file), tweetsFound: candidates.length, tweetsAnalyzed: processed,
+    fileName: path.basename(file), rawFileName: rawFile ? path.basename(rawFile) : null,
+    tweetsFound: candidates.length, tweetsAnalyzed: processed,
     leadsFound: accepted.length, analysisErrors, searchErrors: searchFailures.length, stopped: shouldStop(), rateLimited,
   };
 }
@@ -521,17 +813,19 @@ async function executeRun(job) {
       job.total = progress.total;
       if (Number.isFinite(progress.leadsFound)) job.leadsFound = progress.leadsFound;
       if (progress.fileName) { job.fileName = progress.fileName; job.partialReady = true; }
+      if (progress.rawFileName) { job.rawFileName = progress.rawFileName; job.rawReady = true; }
       job.updatedAt = Date.now();
     }, job.options, () => job.stopRequested);
     job.status = job.stopRequested ? 'stopped' : 'completed';
-    job.stage = job.stopRequested ? 'Stopped · partial Excel ready' : job.result.rateLimited ? 'Rate limit · partial Excel ready' : 'Excel ready';
+    job.stage = job.stopRequested ? 'Stopped · partial Excel ready' : (job.result.rateLimited && job.processed < job.total) ? 'Rate limit · partial Excel ready' : 'Excel ready';
     job.fileName = job.result.fileName;
     job.partialReady = true;
+    if (job.result.rawFileName) { job.rawFileName = job.result.rawFileName; job.rawReady = true; }
     job.leadsFound = job.result.leadsFound;
     job.completedAt = Date.now();
     job.updatedAt = job.completedAt;
     startCooldown(job);
-    if (job.result.rateLimited) job.result.partialReason = 'Groq rate limit persisted after three retries; remaining records were left unprocessed.';
+    if (job.result.rateLimited && job.processed < job.total) job.result.partialReason = 'Groq rate limit persisted after retries; remaining records were left unprocessed.';
     if (job.stopRequested) job.result.partialReason = 'Stopped by user; workbook contains completed classifications so far.';
     job.result.email = await emailWorkbook(job).catch(error => ({ sent: false, error: String(error.message || error).slice(0, 250) }));
     if (job.result.email?.sent) job.stage += ' · emailed';
@@ -544,7 +838,7 @@ async function executeRun(job) {
       // Keep the last atomic checkpoint if a later step fails; it is still useful to the team.
       job.status = 'completed';
       job.stage = 'Partial Excel ready';
-      job.result = { ...(job.result || {}), leadsFound: job.leadsFound || 0, partialReason: job.userMessage };
+      job.result = { ...(job.result || {}), leadsFound: job.leadsFound || 0, partialReason: job.userMessage, rawFileName: job.rawFileName };
       startCooldown(job);
       job.result.email = await emailWorkbook(job).catch(emailError => ({ sent: false, error: String(emailError.message || emailError).slice(0, 250) }));
     } else {
@@ -598,26 +892,136 @@ async function serveStatic(response, fileName, contentType) {
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host || '127.0.0.1'}`);
-    if (request.method === 'GET' && url.pathname === '/') return serveStatic(response, 'index.html', 'text/html; charset=utf-8');
+
+    // Public Assets & System Health Check
+    if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, model: MODEL });
     if (request.method === 'GET' && url.pathname === '/styles.css') return serveStatic(response, 'styles.css', 'text/css; charset=utf-8');
     if (request.method === 'GET' && url.pathname === '/app.js') return serveStatic(response, 'app.js', 'text/javascript; charset=utf-8');
-    if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, model: MODEL });
+
+    // Login Page (redirects to / if already logged in)
+    if (request.method === 'GET' && (url.pathname === '/login' || url.pathname === '/login.html')) {
+      const session = getSession(request);
+      if (session) {
+        response.writeHead(302, { Location: '/' });
+        return response.end();
+      }
+      return serveStatic(response, 'login.html', 'text/html; charset=utf-8');
+    }
+
+    // Check Current Auth Status
+    if (request.method === 'GET' && url.pathname === '/api/auth/me') {
+      const session = getSession(request);
+      if (!session) return json(response, 200, { authenticated: false });
+      return json(response, 200, { authenticated: true, email: session.email });
+    }
+
+    // Login Endpoint (Rate-limited to 20 requests per minute per IP)
+    if (request.method === 'POST' && url.pathname === '/api/auth/login') {
+      const ip = getClientIp(request);
+      const rateCheck = checkLoginRateLimit(ip);
+      if (!rateCheck.allowed) {
+        response.writeHead(429, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Retry-After': String(rateCheck.retryAfterSeconds),
+          'Cache-Control': 'no-store',
+        });
+        return response.end(JSON.stringify({
+          error: `Too many login attempts. Please wait ${rateCheck.retryAfterSeconds} seconds before trying again.`,
+          retryAfter: rateCheck.retryAfterSeconds,
+        }));
+      }
+
+      let body;
+      try { body = await readBody(request); } catch (error) { return json(response, 413, { error: error.message }); }
+      let input;
+      try { input = body ? JSON.parse(body) : {}; } catch { return json(response, 400, { error: 'Invalid JSON request.' }); }
+
+      const validEmail = process.env.EMAIL?.trim();
+      const validPassword = process.env.PASSWORD?.trim();
+      if (!validEmail || !validPassword) {
+        return json(response, 500, { error: 'Authentication is not configured on the server. Please set EMAIL and PASSWORD in .env.' });
+      }
+
+      const inputEmail = String(input.email || '').trim();
+      const inputPassword = String(input.password || '');
+
+      if (!safeCompare(inputEmail, validEmail) || !safeCompare(inputPassword, validPassword)) {
+        return json(response, 401, { error: 'Invalid email or password.' });
+      }
+
+      const token = crypto.randomBytes(32).toString('hex');
+      sessions.set(token, {
+        email: validEmail,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + SESSION_TTL_MS,
+      });
+
+      const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
+      response.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Set-Cookie': `pulse_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}`,
+        'Cache-Control': 'no-store',
+      });
+      return response.end(JSON.stringify({ ok: true, email: validEmail }));
+    }
+
+    // Logout Endpoint
+    if (request.method === 'POST' && url.pathname === '/api/auth/logout') {
+      const cookies = parseCookies(request);
+      const token = cookies.pulse_session;
+      if (token) sessions.delete(token);
+      response.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Set-Cookie': 'pulse_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0',
+        'Cache-Control': 'no-store',
+      });
+      return response.end(JSON.stringify({ ok: true }));
+    }
+
+    // Root Navigation: redirect unauthenticated users to /login
+    if (request.method === 'GET' && url.pathname === '/') {
+      const session = getSession(request);
+      if (!session) {
+        response.writeHead(302, { Location: '/login' });
+        return response.end();
+      }
+      return serveStatic(response, 'index.html', 'text/html; charset=utf-8');
+    }
+
+    // Protect All Remaining API Endpoints
+    const session = getSession(request);
+    if (!session) {
+      if (url.pathname.startsWith('/api/')) {
+        return json(response, 401, { error: 'Unauthorized. Please log in.' });
+      }
+      response.writeHead(302, { Location: '/login' });
+      return response.end();
+    }
+
     if (request.method === 'GET' && url.pathname === '/api/freelancer/campaigns') return json(response, 200, CAMPAIGNS);
     if (request.method === 'GET' && url.pathname === '/api/scripts') return json(response, 200, scriptsPayload());
     if (request.method === 'GET' && url.pathname === '/api/runs') {
       const recent = [...jobs.values()].sort((a, b) => b.createdAt - a.createdAt).map(publicJob);
       return json(response, 200, recent);
     }
-    const downloadMatch = url.pathname.match(/^\/api\/runs\/([a-f0-9-]+)\/download$/i);
+    const downloadMatch = url.pathname.match(/^\/api\/runs\/([a-f0-9-]+)\/download(?:\/(raw))?$/i);
     if (request.method === 'GET' && downloadMatch) {
+      const isRaw = downloadMatch[2] === 'raw';
       const job = jobs.get(downloadMatch[1]);
-      if (!job || !job.partialReady || !job.fileName || !['queued', 'running', 'completed', 'stopped'].includes(job.status)) return json(response, 404, { error: 'Excel file is not ready or is no longer available.' });
-      const file = path.join(job.outputDir, job.fileName);
+      if (!job) return json(response, 404, { error: 'Run not found.' });
+
+      const targetFileName = isRaw ? job.rawFileName : job.fileName;
+      const isReady = isRaw ? Boolean(job.rawReady && job.rawFileName) : Boolean(job.partialReady && job.fileName);
+
+      if (!isReady || !targetFileName || !['queued', 'running', 'completed', 'stopped'].includes(job.status)) {
+        return json(response, 404, { error: isRaw ? 'All candidates file is not ready or is no longer available.' : 'Excel file is not ready or is no longer available.' });
+      }
+      const file = path.join(job.outputDir, targetFileName);
       try { await fs.access(file); } catch { return json(response, 404, { error: 'Excel file is no longer available.' }); }
       job.downloads++;
       response.writeHead(200, {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Content-Disposition': `attachment; filename="${job.fileName}"`,
+        'Content-Disposition': `attachment; filename="${targetFileName}"`,
         'Cache-Control': 'no-store',
       });
       const stream = fsSync.createReadStream(file);
@@ -670,7 +1074,7 @@ const server = http.createServer(async (request, response) => {
       const job = {
         id, script, title, options, outputDir: path.join(JOB_ROOT, id), status: 'queued', stage: 'Waiting to start',
         processed: 0, total: 0, createdAt: Date.now(), updatedAt: Date.now(), completedAt: null,
-        expiresAt: null, fileName: null, error: null, result: null, downloads: 0,
+        expiresAt: null, fileName: null, rawFileName: null, rawReady: false, error: null, result: null, downloads: 0,
       };
       jobs.set(id, job);
       scriptLocks.set(script, { jobId: id, running: true, until: null });

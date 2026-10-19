@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f7f8">
+  <title>Sign In · Project Pulse</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body class="login-body">
+  <main class="login-shell">
+    <div class="login-card">
+      <header class="login-header">
+        <div class="brand-mark large" aria-hidden="true">P</div>
+        <h1>Sign In to Project Pulse</h1>
+        <p class="login-subtitle">Enter your credentials to access the lead search dashboard.</p>
+      </header>
+
+      <div id="login-alert" class="login-alert" role="alert" hidden></div>
+
+      <form id="login-form" class="login-form" novalidate>
+        <div class="field-group">
+          <label for="login-email">Email Address</label>
+          <input
+            id="login-email"
+            name="email"
+            type="email"
+            autocomplete="email"
+            required
+            placeholder="admin@example.com"
+            spellcheck="false"
+          >
+        </div>
+
+        <div class="field-group">
+          <label for="login-password">Password</label>
+          <div class="password-wrapper">
+            <input
+              id="login-password"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required
+              placeholder="••••••••••••"
+            >
+            <button
+              id="toggle-password"
+              type="button"
+              class="toggle-password-btn"
+              aria-label="Toggle password visibility"
+            >Show</button>
+          </div>
+        </div>
+
+        <button id="login-submit" class="run-button login-button" type="submit">
+          <span class="btn-text">Sign In</span>
+        </button>
+      </form>
+
+      <footer class="login-footer">
+        <p class="login-note">Protected by login rate limiting (max 20 attempts / min).</p>
+      </footer>
+    </div>
+  </main>
+
+  <script>
+    const form = document.querySelector('#login-form');
+    const emailInput = document.querySelector('#login-email');
+    const passwordInput = document.querySelector('#login-password');
+    const submitBtn = document.querySelector('#login-submit');
+    const alertBox = document.querySelector('#login-alert');
+    const togglePasswordBtn = document.querySelector('#toggle-password');
+    let countdownInterval = null;
+
+    togglePasswordBtn.addEventListener('click', () => {
+      const isPassword = passwordInput.type === 'password';
+      passwordInput.type = isPassword ? 'text' : 'password';
+      togglePasswordBtn.textContent = isPassword ? 'Hide' : 'Show';
+    });
+
+    function showAlert(message, isRateLimit = false, seconds = 0) {
+      clearInterval(countdownInterval);
+      alertBox.hidden = false;
+      alertBox.classList.toggle('rate-limit', isRateLimit);
+      
+      if (isRateLimit && seconds > 0) {
+        let remaining = seconds;
+        submitBtn.disabled = true;
+        const updateText = () => {
+          alertBox.innerHTML = `<strong>Rate limit exceeded.</strong> Too many login attempts. Please wait <strong>${remaining}s</strong> before trying again.`;
+        };
+        updateText();
+        countdownInterval = setInterval(() => {
+          remaining -= 1;
+          if (remaining <= 0) {
+            clearInterval(countdownInterval);
+            alertBox.hidden = true;
+            submitBtn.disabled = false;
+          } else {
+            updateText();
+          }
+        }, 1000);
+      } else {
+        alertBox.textContent = message;
+      }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const email = emailInput.value.trim();
+      const password = passwordInput.value;
+
+      if (!email || !password) {
+        showAlert('Please enter both your email address and password.');
+        return;
+      }
+
+      alertBox.hidden = true;
+      submitBtn.disabled = true;
+      submitBtn.querySelector('.btn-text').textContent = 'Signing in…';
+
+      try {
+        const response = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (response.status === 429) {
+          showAlert(data.error || 'Rate limit exceeded.', true, data.retryAfter || 60);
+          return;
+        }
+
+        if (!response.ok) {
+          showAlert(data.error || 'Invalid email or password. Please try again.');
+          submitBtn.disabled = false;
+          submitBtn.querySelector('.btn-text').textContent = 'Sign In';
+          return;
+        }
+
+        // Successfully authenticated
+        submitBtn.querySelector('.btn-text').textContent = 'Success! Redirecting…';
+        window.location.href = '/';
+      } catch (err) {
+        showAlert('Could not reach the server. Please check your connection.');
+        submitBtn.disabled = false;
+        submitBtn.querySelector('.btn-text').textContent = 'Sign In';
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -13,6 +13,10 @@
       <div class="brand-mark" aria-hidden="true">P</div>
       <span>Project Pulse</span>
       <span class="topbar-note">Lead finder</span>
+      <div class="user-nav" id="user-nav" hidden>
+        <span class="user-email-chip" id="user-email"></span>
+        <button id="logout-btn" class="logout-btn" type="button">Sign out</button>
+      </div>
     </header>
 
     <section class="intro">
@@ -43,6 +47,7 @@
       </div>
       <p class="filter-note">Budget range checks project budgets in the selected currency; only USD or INR listings are included.</p>
       <p id="freelancer-status" class="run-status" aria-live="polite"></p>
+      <div id="freelancer-downloads" class="download-actions freelancer-downloads"></div>
     </section>
 
     <section class="section-head">
