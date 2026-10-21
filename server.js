@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const ExcelJS = require('exceljs');
 const { CAMPAIGNS, searchFreelancer } = require('./Scripts/freelancer_search');
 const { ROLES: TWITTER_ROLES, searchTwitter } = require('./Scripts/twitter_search');
+const db = require('./db');
 
 function loadEnv(file) {
   try {
@@ -169,13 +170,10 @@ function scheduleCleanup(job, delay = RUN_TTL_MS) {
 }
 async function cleanupJob(job) {
   if (job.downloads > 0) return scheduleCleanup(job, 5000);
-  try { await fs.rm(job.outputDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 500 }); }
-  catch { return scheduleCleanup(job, 5000); }
   jobs.delete(job.id);
-  try { await fs.rmdir(JOB_ROOT); } catch { }
-  try { await fs.rmdir(path.dirname(JOB_ROOT)); } catch { }
   const lock = scriptLocks.get(job.script);
   if (lock?.jobId === job.id) scriptLocks.delete(job.script);
+  try { await db.deleteJob(job.id); } catch (err) { console.error('[cleanup db error]', err.message); }
 }
 async function retryBusy(operation) {
   for (let attempt = 0; ; attempt++) {
@@ -516,8 +514,7 @@ async function analyzeTweetNow(role, tweet, sourceType = 'X post') {
   }
   throw new Error('Groq retries exhausted');
 }
-async function saveWorkbook(roleKey, outputDir, rows) {
-  const file = path.join(outputDir, `leads_${roleKey}.xlsx`);
+function buildTweetsLeadsWorkbook(roleKey, rows) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('Leads');
   sheet.addRow(HEADERS);
@@ -525,18 +522,19 @@ async function saveWorkbook(roleKey, outputDir, rows) {
   sheet.views = [{ state: 'frozen', ySplit: 1 }];
   sheet.autoFilter = { from: 'A1', to: 'N1' };
   [24, 22, 22, 65, 48, 16, 22, 18, 26, 50, 50, 20, 30, 14].forEach((width, index) => { sheet.getColumn(index + 1).width = width; });
-  for (const { tweet, type, analysis } of rows) {
-    sheet.addRow([safeText(tweet.id), safeText(tweet.createdAt), safeText(tweet.user), safeText(tweet.text), safeText(tweet.link), type,
-    safeText(analysis.intent), Boolean(analysis.potentialLead), safeText(analysis.requestedRole), safeText(analysis.projectSummary),
-    safeText(analysis.requirements), safeText(analysis.budget), safeText(analysis.contact), Number(analysis.confidence) || 0]);
+  for (const item of rows) {
+    const tweet = item.tweet || item.project || item;
+    const analysis = item.analysis || {};
+    const type = item.type || 'Top';
+    sheet.addRow([
+      safeText(tweet.id), safeText(tweet.createdAt), safeText(tweet.user), safeText(tweet.text), safeText(tweet.link), type,
+      safeText(analysis.intent), Boolean(analysis.potentialLead), safeText(analysis.requestedRole), safeText(analysis.projectSummary),
+      safeText(analysis.requirements), safeText(analysis.budget), safeText(analysis.contact), Number(analysis.confidence) || 0
+    ]);
   }
-  const tempFile = `${file}.${process.pid}.tmp.xlsx`;
-  await retryBusy(() => workbook.xlsx.writeFile(tempFile));
-  await retryBusy(() => fs.rename(tempFile, file));
-  return file;
+  return workbook;
 }
-async function saveFreelancerWorkbook(outputDir, rows) {
-  const file = path.join(outputDir, 'leads_freelancer.xlsx');
+function buildFreelancerLeadsWorkbook(rows) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('Freelancer Leads');
   const headers = ['Project ID', 'Posted At', 'Campaigns', 'Title', 'Description', 'Project Type', 'Budget', 'Bids', 'Average Bid (USD)', 'Language', 'Matched Terms', 'Intent', 'Potential Lead', 'Project Summary', 'Requirements', 'Confidence', 'Project URL'];
@@ -545,22 +543,20 @@ async function saveFreelancerWorkbook(outputDir, rows) {
   sheet.views = [{ state: 'frozen', ySplit: 1 }];
   sheet.autoFilter = { from: 'A1', to: 'Q1' };
   [18, 24, 34, 42, 68, 15, 22, 12, 22, 14, 34, 20, 18, 48, 50, 14, 58].forEach((width, index) => { sheet.getColumn(index + 1).width = width; });
-  for (const { project, analysis } of rows) {
+  for (const item of rows) {
+    const project = item.project || item.tweet || item;
+    const analysis = item.analysis || {};
     sheet.addRow([
-      safeText(project.id), safeText(project.postedAt), safeText(project.campaigns.join(', ')), safeText(project.title),
-      safeText(project.description), safeText(project.projectType), safeText(project.budgetOriginal), project.bidCount,
-      project.averageBid ?? '', safeText(project.language), safeText(project.matchedKeywords.join(', ')),
+      safeText(project.id), safeText(project.postedAt), safeText(Array.isArray(project.campaigns) ? project.campaigns.join(', ') : project.campaigns), safeText(project.title),
+      safeText(project.description), safeText(project.projectType), safeText(project.budgetOriginal), project.bidCount ?? 0,
+      project.averageBid ?? '', safeText(project.language), safeText(Array.isArray(project.matchedKeywords) ? project.matchedKeywords.join(', ') : project.matchedKeywords),
       safeText(analysis.intent), Boolean(analysis.potentialLead), safeText(analysis.projectSummary),
       safeText(analysis.requirements), Number(analysis.confidence) || 0, safeText(project.url),
     ]);
   }
-  const tempFile = `${file}.${process.pid}.tmp.xlsx`;
-  await retryBusy(() => workbook.xlsx.writeFile(tempFile));
-  await retryBusy(() => fs.rename(tempFile, file));
-  return file;
+  return workbook;
 }
-async function saveAllFreelancerWorkbook(outputDir, matchingProjects) {
-  const file = path.join(outputDir, 'all_candidates_freelancer.xlsx');
+function buildAllFreelancerWorkbook(matchingProjects) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('All Freelancer Candidates');
   const headers = ['Project ID', 'Posted At', 'Campaigns', 'Title', 'Description', 'Project Type', 'Budget', 'Bids', 'Average Bid (USD)', 'Language', 'Project URL'];
@@ -569,11 +565,12 @@ async function saveAllFreelancerWorkbook(outputDir, matchingProjects) {
   sheet.views = [{ state: 'frozen', ySplit: 1 }];
   sheet.autoFilter = { from: 'A1', to: 'K1' };
   [18, 24, 34, 42, 68, 15, 22, 12, 22, 14, 58].forEach((width, index) => { sheet.getColumn(index + 1).width = width; });
-  for (const project of matchingProjects) {
+  for (const item of matchingProjects) {
+    const project = item.project || item;
     sheet.addRow([
       safeText(project.id),
       safeText(project.postedAt),
-      safeText(project.campaigns?.join(', ')),
+      safeText(Array.isArray(project.campaigns) ? project.campaigns.join(', ') : project.campaigns),
       safeText(project.title),
       safeText(project.description),
       safeText(project.projectType),
@@ -584,13 +581,9 @@ async function saveAllFreelancerWorkbook(outputDir, matchingProjects) {
       safeText(project.url),
     ]);
   }
-  const tempFile = `${file}.${process.pid}.tmp.xlsx`;
-  await retryBusy(() => workbook.xlsx.writeFile(tempFile));
-  await retryBusy(() => fs.rename(tempFile, file));
-  return file;
+  return workbook;
 }
-async function saveAllTweetsWorkbook(roleKey, outputDir, candidates) {
-  const file = path.join(outputDir, `all_candidates_${roleKey}.xlsx`);
+function buildAllTweetsWorkbook(roleKey, candidates) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('All Candidates');
   const headers = ['Tweet ID', 'Created At', 'Username', 'Tweet Text', 'Tweet URL', 'Search Role'];
@@ -611,10 +604,7 @@ async function saveAllTweetsWorkbook(roleKey, outputDir, candidates) {
       roleTitle,
     ]);
   }
-  const tempFile = `${file}.${process.pid}.tmp.xlsx`;
-  await retryBusy(() => workbook.xlsx.writeFile(tempFile));
-  await retryBusy(() => fs.rename(tempFile, file));
-  return file;
+  return workbook;
 }
 function filterFreelancerProjects(projects, options) {
   const min = options.minBudget;
@@ -627,28 +617,21 @@ function filterFreelancerProjects(projects, options) {
     return true;
   });
 }
-async function runFreelancer(outputDir, onProgress, options, shouldStop) {
+async function runFreelancer(jobId, onProgress, options, shouldStop) {
   const search = await searchFreelancer(options.campaigns, onProgress, shouldStop);
   const matching = filterFreelancerProjects(search.projects, options);
-  await fs.writeFile(path.join(outputDir, 'freelancer_projects.json'), JSON.stringify(matching, null, 2), 'utf8');
-  await fs.writeFile(path.join(outputDir, 'summary.json'), JSON.stringify({
-    platform: 'Freelancer.com', windowDays: 3, selectedCampaigns: options.campaigns,
-    currency: options.currency, minBudget: options.minBudget, maxBudget: options.maxBudget,
-    projectsFound: search.projects.length, projectsMatchingFilters: matching.length, searchErrors: search.searchErrors,
-    searches: search.log,
-  }, null, 2), 'utf8');
   if (!shouldStop() && !search.projects.length && search.searchErrors === search.log.length) {
     throw new Error(search.log.filter(item => item.error).map(item => item.error).join('; ') || 'Freelancer.com searches failed.');
   }
 
-  let rawFile = null;
+  const rawFileName = 'all_candidates_freelancer.xlsx';
   if (matching.length > 0) {
-    rawFile = await saveAllFreelancerWorkbook(outputDir, matching);
+    await db.saveCandidates(jobId, 'freelancer', matching);
     onProgress({
       stage: 'Freelancer.com projects fetched · all candidates ready',
       processed: 0,
       total: matching.length,
-      rawFileName: path.basename(rawFile),
+      rawFileName,
       rawReady: true,
     });
   }
@@ -667,6 +650,7 @@ async function runFreelancer(outputDir, onProgress, options, shouldStop) {
     }));
     onProgress({ stage: 'Analyzing Freelancer.com projects', processed, total: matching.length, leadsFound: accepted.length });
     let analyzedCount = 0;
+    const batchAccepted = [];
     try {
       const analyses = new Map(await analyzeRecords('Freelancer.com client project', 'Freelancer.com project listing', batch, shouldStop, waitStage => {
         onProgress({ stage: waitStage, processed, total: matching.length, leadsFound: accepted.length });
@@ -675,7 +659,10 @@ async function runFreelancer(outputDir, onProgress, options, shouldStop) {
       for (const item of batch) {
         const analysis = analyses.get(item.id);
         if (!analysis) continue;
-        if (analysis.potentialLead === true && analysis.intent === 'buyer_request' && Number(analysis.confidence) >= 0.55) accepted.push({ project: item.project, analysis });
+        if (analysis.potentialLead === true && analysis.intent === 'buyer_request' && Number(analysis.confidence) >= 0.55) {
+          accepted.push({ project: item.project, analysis });
+          batchAccepted.push({ project: item.project, analysis });
+        }
       }
     } catch (error) {
       const partial = new Map(error.partialResults || []);
@@ -683,7 +670,10 @@ async function runFreelancer(outputDir, onProgress, options, shouldStop) {
       analysisErrors += Math.max(0, batch.length - partial.size);
       for (const item of batch) {
         const analysis = partial.get(item.id);
-        if (analysis?.potentialLead === true && analysis.intent === 'buyer_request' && Number(analysis.confidence) >= 0.55) accepted.push({ project: item.project, analysis });
+        if (analysis?.potentialLead === true && analysis.intent === 'buyer_request' && Number(analysis.confidence) >= 0.55) {
+          accepted.push({ project: item.project, analysis });
+          batchAccepted.push({ project: item.project, analysis });
+        }
       }
       console.error('[Freelancer project batch analysis failed]', batch.map(item => item.id).join(','), error);
       if (isGroq429(error)) {
@@ -691,30 +681,28 @@ async function runFreelancer(outputDir, onProgress, options, shouldStop) {
         await waitWithStop(4000, shouldStop);
       }
     }
+    if (batchAccepted.length > 0) {
+      await db.saveLeadBatch(jobId, batchAccepted);
+    }
     processed += analyzedCount;
-    // Atomic workbook checkpoint after every batch makes partial results downloadable.
-    const file = await saveFreelancerWorkbook(outputDir, accepted);
     onProgress({
       stage: shouldStop() ? 'Stopping · partial Excel ready' : 'Analyzing Freelancer.com projects',
-      processed, total: matching.length, leadsFound: accepted.length, fileName: path.basename(file), partialReady: true,
-      rawFileName: rawFile ? path.basename(rawFile) : null, rawReady: Boolean(rawFile)
+      processed, total: matching.length, leadsFound: accepted.length, fileName: 'leads_freelancer.xlsx', partialReady: true,
+      rawFileName: matching.length > 0 ? rawFileName : null, rawReady: matching.length > 0
     });
   }
-  const file = await saveFreelancerWorkbook(outputDir, accepted);
   return {
-    fileName: path.basename(file), rawFileName: rawFile ? path.basename(rawFile) : null,
+    fileName: 'leads_freelancer.xlsx', rawFileName: matching.length > 0 ? rawFileName : null,
     projectsFound: search.projects.length, projectsAnalyzed: processed, projectsMatching: matching.length,
     leadsFound: accepted.length, analysisErrors, searchErrors: search.searchErrors, stopped: shouldStop(), rateLimited,
     searchErrorDetails: search.log.filter(item => item.error).slice(0, 3).map(item => `${item.keyword}: ${item.error}`),
   };
 }
-async function runRole(roleKey, outputDir, onProgress, options, shouldStop) {
-  if (roleKey === 'freelancer') return runFreelancer(outputDir, onProgress, options, shouldStop);
+async function runRole(roleKey, jobId, onProgress, options, shouldStop) {
+  if (roleKey === 'freelancer') return runFreelancer(jobId, onProgress, options, shouldStop);
   const search = await searchTwitter(roleKey, process.env.TWITTER_API_KEY, onProgress, shouldStop);
   const candidates = search.tweets.map(tweet => ({ tweet, type: 'Top' }));
   const summaryRows = search.log.map(row => ({ test: `group_${row.group}`, count: row.error ? -1 : row.count, error: row.error }));
-  await fs.writeFile(path.join(outputDir, `tweets_A_${roleKey}_Top.json`), JSON.stringify(search.tweets, null, 2), 'utf8');
-  await fs.writeFile(path.join(outputDir, 'summary.json'), JSON.stringify(summaryRows, null, 2), 'utf8');
   const searchFailures = summaryRows.filter(row => row.error);
   if (!shouldStop() && (!summaryRows.length || !summaryRows.some(row => row.count >= 0))) {
     throw new Error(searchFailures.map(row => row.error || `${row.test} search failed`).join('; ') || 'No search groups completed.');
@@ -726,19 +714,26 @@ async function runRole(roleKey, outputDir, onProgress, options, shouldStop) {
     seen.add(id); return true;
   });
 
-  let rawFile = null;
+  const rawFileName = `all_candidates_${roleKey}.xlsx`;
   if (unique.length > 0) {
-    rawFile = await saveAllTweetsWorkbook(roleKey, outputDir, unique);
+    await db.saveCandidates(jobId, roleKey, unique);
     onProgress({
       stage: 'Top tweets fetched · all candidates ready',
       processed: 0,
       total: unique.length,
-      rawFileName: path.basename(rawFile),
+      rawFileName,
       rawReady: true,
     });
   }
 
-  onProgress({ stage: 'Analyzing Top tweets', processed: 0, total: unique.length, rawFileName: rawFile ? path.basename(rawFile) : null, rawReady: Boolean(rawFile) });
+  onProgress({
+    stage: 'Analyzing Top tweets',
+    processed: 0,
+    total: unique.length,
+    rawFileName: unique.length > 0 ? rawFileName : null,
+    rawReady: unique.length > 0,
+  });
+
   const accepted = [];
   let analysisErrors = 0;
   let processed = 0;
@@ -746,6 +741,7 @@ async function runRole(roleKey, outputDir, onProgress, options, shouldStop) {
   for (let start = 0; start < unique.length && !shouldStop(); start += AI_BATCH_SIZE) {
     const batch = unique.slice(start, start + AI_BATCH_SIZE).map((item, offset) => ({ id: safeText(item.tweet.id) || String(start + offset), ...item }));
     let analyzedCount = 0;
+    const batchAccepted = [];
     try {
       const analyses = new Map(await analyzeRecords(roleKey, 'X post', batch.map(item => ({ id: item.id, tweet: item.tweet })), shouldStop, waitStage => {
         onProgress({ stage: waitStage, processed, total: unique.length, leadsFound: accepted.length });
@@ -753,7 +749,10 @@ async function runRole(roleKey, outputDir, onProgress, options, shouldStop) {
       analyzedCount = analyses.size;
       for (const item of batch) {
         const analysis = analyses.get(item.id);
-        if (analysis?.potentialLead === true && analysis.intent === 'buyer_request' && Number(analysis.confidence) >= 0.55) accepted.push({ ...item, analysis });
+        if (analysis?.potentialLead === true && analysis.intent === 'buyer_request' && Number(analysis.confidence) >= 0.55) {
+          accepted.push({ ...item, analysis });
+          batchAccepted.push({ ...item, analysis });
+        }
       }
     } catch (error) {
       const partial = new Map(error.partialResults || []);
@@ -761,7 +760,10 @@ async function runRole(roleKey, outputDir, onProgress, options, shouldStop) {
       analysisErrors += Math.max(0, batch.length - partial.size);
       for (const item of batch) {
         const analysis = partial.get(item.id);
-        if (analysis?.potentialLead === true && analysis.intent === 'buyer_request' && Number(analysis.confidence) >= 0.55) accepted.push({ ...item, analysis });
+        if (analysis?.potentialLead === true && analysis.intent === 'buyer_request' && Number(analysis.confidence) >= 0.55) {
+          accepted.push({ ...item, analysis });
+          batchAccepted.push({ ...item, analysis });
+        }
       }
       console.error('[tweet batch analysis failed]', roleKey, batch.map(item => item.id).join(','), error);
       if (isGroq429(error)) {
@@ -769,19 +771,32 @@ async function runRole(roleKey, outputDir, onProgress, options, shouldStop) {
         await waitWithStop(4000, shouldStop);
       }
     }
+    if (batchAccepted.length > 0) {
+      await db.saveLeadBatch(jobId, batchAccepted);
+    }
     processed += analyzedCount;
-    const file = await saveWorkbook(roleKey, outputDir, accepted);
     onProgress({
-      stage: shouldStop() ? 'Stopping · partial Excel ready' : 'Analyzing Top tweets', processed, total: unique.length,
-      leadsFound: accepted.length, fileName: path.basename(file), partialReady: true,
-      rawFileName: rawFile ? path.basename(rawFile) : null, rawReady: Boolean(rawFile)
+      stage: shouldStop() ? 'Stopping · partial Excel ready' : 'Analyzing Top tweets',
+      processed,
+      total: unique.length,
+      leadsFound: accepted.length,
+      fileName: `leads_${roleKey}.xlsx`,
+      partialReady: true,
+      rawFileName: unique.length > 0 ? rawFileName : null,
+      rawReady: unique.length > 0,
     });
   }
-  const file = await saveWorkbook(roleKey, outputDir, accepted);
+
   return {
-    fileName: path.basename(file), rawFileName: rawFile ? path.basename(rawFile) : null,
-    tweetsFound: candidates.length, tweetsAnalyzed: processed,
-    leadsFound: accepted.length, analysisErrors, searchErrors: searchFailures.length, stopped: shouldStop(), rateLimited,
+    fileName: `leads_${roleKey}.xlsx`,
+    rawFileName: unique.length > 0 ? rawFileName : null,
+    tweetsFound: candidates.length,
+    tweetsAnalyzed: processed,
+    leadsFound: accepted.length,
+    analysisErrors,
+    searchErrors: searchFailures.length,
+    stopped: shouldStop(),
+    rateLimited,
   };
 }
 function startCooldown(job) {
@@ -805,9 +820,9 @@ function safeRunError(error) {
 async function executeRun(job) {
   job.status = 'running';
   job.stage = job.script === 'freelancer' ? 'Searching Freelancer.com' : 'Searching Top tweets';
+  await db.upsertJob(job);
   try {
-    await fs.mkdir(job.outputDir, { recursive: true });
-    job.result = await runRole(job.script, job.outputDir, progress => {
+    job.result = await runRole(job.script, job.id, async progress => {
       job.stage = progress.stage;
       job.processed = progress.processed;
       job.total = progress.total;
@@ -815,6 +830,7 @@ async function executeRun(job) {
       if (progress.fileName) { job.fileName = progress.fileName; job.partialReady = true; }
       if (progress.rawFileName) { job.rawFileName = progress.rawFileName; job.rawReady = true; }
       job.updatedAt = Date.now();
+      await db.upsertJob(job);
     }, job.options, () => job.stopRequested);
     job.status = job.stopRequested ? 'stopped' : 'completed';
     job.stage = job.stopRequested ? 'Stopped · partial Excel ready' : (job.result.rateLimited && job.processed < job.total) ? 'Rate limit · partial Excel ready' : 'Excel ready';
@@ -827,28 +843,41 @@ async function executeRun(job) {
     startCooldown(job);
     if (job.result.rateLimited && job.processed < job.total) job.result.partialReason = 'Groq rate limit persisted after retries; remaining records were left unprocessed.';
     if (job.stopRequested) job.result.partialReason = 'Stopped by user; workbook contains completed classifications so far.';
+    await db.upsertJob(job);
     job.result.email = await emailWorkbook(job).catch(error => ({ sent: false, error: String(error.message || error).slice(0, 250) }));
-    if (job.result.email?.sent) job.stage += ' · emailed';
+    if (job.result.email?.sent) {
+      job.stage += ' · emailed';
+      await db.upsertJob(job);
+    }
   } catch (error) {
     console.error('[run]', job.id, error);
     job.error = error.message;
     job.userMessage = safeRunError(error);
     job.updatedAt = Date.now();
-    if (job.partialReady && job.fileName) {
-      // Keep the last atomic checkpoint if a later step fails; it is still useful to the team.
+    if ((job.partialReady && job.fileName) || (job.rawReady && job.rawFileName)) {
+      // Keep whatever we collected (raw candidates and/or partial leads) even if AI analysis fails.
       job.status = 'completed';
-      job.stage = 'Partial Excel ready';
+      job.stage = (job.partialReady && job.fileName)
+        ? 'Partial Excel ready'
+        : 'All candidates ready · AI service error';
       job.result = { ...(job.result || {}), leadsFound: job.leadsFound || 0, partialReason: job.userMessage, rawFileName: job.rawFileName };
       startCooldown(job);
-      job.result.email = await emailWorkbook(job).catch(emailError => ({ sent: false, error: String(emailError.message || emailError).slice(0, 250) }));
+      await db.upsertJob(job);
+      if (job.partialReady && job.fileName) {
+        job.result.email = await emailWorkbook(job).catch(emailError => ({ sent: false, error: String(emailError.message || emailError).slice(0, 250) }));
+        if (job.result.email?.sent) {
+          job.stage += ' · emailed';
+          await db.upsertJob(job);
+        }
+      }
     } else {
       job.status = 'failed';
       job.stage = 'Run failed';
       const lock = scriptLocks.get(job.script);
       if (lock?.jobId === job.id) scriptLocks.delete(job.script);
-      try { await fs.rm(job.outputDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 500 }); } catch { }
       job.expiresAt = Date.now() + RUN_TTL_MS;
       scheduleCleanup(job, RUN_TTL_MS);
+      await db.upsertJob(job);
     }
   }
 }
@@ -859,16 +888,21 @@ async function emailWorkbook(job) {
   // Email is optional until all three settings are supplied in the service environment.
   if (!apiKey && !to.length && !from) return { sent: false, skipped: true, message: 'Email is not configured.' };
   if (!apiKey || !to.length || !from) return { sent: false, error: 'Resend email settings are incomplete.' };
-  const file = path.join(job.outputDir, job.fileName);
-  const data = await fs.readFile(file);
-  if (Math.ceil(data.length / 3) * 4 > 40 * 1024 * 1024) throw new Error('The workbook is larger than Resend’s 40 MB email attachment limit.');
+
+  const leads = await db.getLeads(job.id);
+  const workbook = job.script === 'freelancer'
+    ? buildFreelancerLeadsWorkbook(leads)
+    : buildTweetsLeadsWorkbook(job.script, leads);
+  const buffer = await workbook.xlsx.writeBuffer();
+  if (Math.ceil(buffer.length / 3) * 4 > 40 * 1024 * 1024) throw new Error('The workbook is larger than Resend’s 40 MB email attachment limit.');
+
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     signal: AbortSignal.timeout(30000),
     body: JSON.stringify({
       from, to, subject: `${job.title} · ${job.result.leadsFound} leads${job.status === 'stopped' || job.result.rateLimited ? ' · partial results' : ''}`,
       text: `Your ${job.title} spreadsheet is attached.\nLeads: ${job.result.leadsFound}\nStatus: ${job.stage}\nRun ID: ${job.id}`,
-      attachments: [{ filename: job.fileName, content: data.toString('base64') }],
+      attachments: [{ filename: job.fileName || `leads_${job.script}.xlsx`, content: Buffer.from(buffer).toString('base64') }],
     }),
   });
   if (!response.ok) throw new Error(`Resend HTTP ${response.status}: ${(await response.text()).slice(0, 400)}`);
@@ -1004,32 +1038,65 @@ const server = http.createServer(async (request, response) => {
       const recent = [...jobs.values()].sort((a, b) => b.createdAt - a.createdAt).map(publicJob);
       return json(response, 200, recent);
     }
-    const downloadMatch = url.pathname.match(/^\/api\/runs\/([a-f0-9-]+)\/download(?:\/(raw))?$/i);
+    const downloadMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/download(?:\/(raw))?$/i);
     if (request.method === 'GET' && downloadMatch) {
       const isRaw = downloadMatch[2] === 'raw';
-      const job = jobs.get(downloadMatch[1]);
+      const jobId = downloadMatch[1];
+      let job = jobs.get(jobId);
+      if (!job) {
+        const dbJob = await db.getJob(jobId);
+        if (dbJob) {
+          job = {
+            id: dbJob.id,
+            script: dbJob.script,
+            title: dbJob.title,
+            status: dbJob.status,
+            stage: dbJob.stage,
+            fileName: dbJob.file_name || `leads_${dbJob.script}.xlsx`,
+            rawFileName: dbJob.raw_file_name || `all_candidates_${dbJob.script}.xlsx`,
+            rawReady: Boolean(dbJob.raw_ready || dbJob.status === 'completed'),
+            partialReady: Boolean(dbJob.partial_ready || dbJob.status === 'completed' || dbJob.status === 'stopped'),
+            downloads: 0,
+          };
+        }
+      }
       if (!job) return json(response, 404, { error: 'Run not found.' });
 
-      const targetFileName = isRaw ? job.rawFileName : job.fileName;
+      const targetFileName = isRaw ? (job.rawFileName || `all_candidates_${job.script}.xlsx`) : (job.fileName || `leads_${job.script}.xlsx`);
       const isReady = isRaw ? Boolean(job.rawReady && job.rawFileName) : Boolean(job.partialReady && job.fileName);
 
-      if (!isReady || !targetFileName || !['queued', 'running', 'completed', 'stopped'].includes(job.status)) {
+      if (!isReady || !['queued', 'running', 'completed', 'stopped'].includes(job.status)) {
         return json(response, 404, { error: isRaw ? 'All candidates file is not ready or is no longer available.' : 'Excel file is not ready or is no longer available.' });
       }
-      const file = path.join(job.outputDir, targetFileName);
-      try { await fs.access(file); } catch { return json(response, 404, { error: 'Excel file is no longer available.' }); }
-      job.downloads++;
-      response.writeHead(200, {
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Content-Disposition': `attachment; filename="${targetFileName}"`,
-        'Cache-Control': 'no-store',
-      });
-      const stream = fsSync.createReadStream(file);
-      stream.on('error', () => response.destroy());
-      stream.on('close', () => { job.downloads = Math.max(0, job.downloads - 1); });
-      return stream.pipe(response);
+
+      job.downloads = (job.downloads || 0) + 1;
+      try {
+        let workbook;
+        if (isRaw) {
+          const candidates = await db.getCandidates(job.id);
+          if (!candidates.length) return json(response, 404, { error: 'No candidate data found for this run.' });
+          workbook = job.script === 'freelancer'
+            ? buildAllFreelancerWorkbook(candidates)
+            : buildAllTweetsWorkbook(job.script, candidates);
+        } else {
+          const leads = await db.getLeads(job.id);
+          workbook = job.script === 'freelancer'
+            ? buildFreelancerLeadsWorkbook(leads)
+            : buildTweetsLeadsWorkbook(job.script, leads);
+        }
+
+        const buffer = await workbook.xlsx.writeBuffer();
+        response.writeHead(200, {
+          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'Content-Disposition': `attachment; filename="${targetFileName}"`,
+          'Cache-Control': 'no-store',
+        });
+        return response.end(Buffer.from(buffer));
+      } finally {
+        job.downloads = Math.max(0, (job.downloads || 1) - 1);
+      }
     }
-    const stopMatch = url.pathname.match(/^\/api\/runs\/([a-f0-9-]+)\/stop$/i);
+    const stopMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/stop$/i);
     if (request.method === 'POST' && stopMatch) {
       const job = jobs.get(stopMatch[1]);
       if (!job) return json(response, 404, { error: 'Run not found.' });
@@ -1077,13 +1144,40 @@ const server = http.createServer(async (request, response) => {
         expiresAt: null, fileName: null, rawFileName: null, rawReady: false, error: null, result: null, downloads: 0,
       };
       jobs.set(id, job);
+      await db.upsertJob(job);
       scriptLocks.set(script, { jobId: id, running: true, until: null });
       setImmediate(() => { void executeRun(job); });
       return json(response, 202, publicJob(job));
     }
-    const runMatch = url.pathname.match(/^\/api\/runs\/([a-f0-9-]+)$/i);
+    const runMatch = url.pathname.match(/^\/api\/runs\/([^/]+)$/i);
     if (request.method === 'GET' && runMatch) {
-      const job = jobs.get(runMatch[1]);
+      let job = jobs.get(runMatch[1]);
+      if (!job) {
+        const dbJob = await db.getJob(runMatch[1]);
+        if (dbJob) {
+          job = {
+            id: dbJob.id,
+            script: dbJob.script,
+            title: dbJob.title,
+            status: dbJob.status,
+            stage: dbJob.stage,
+            processed: dbJob.processed,
+            total: dbJob.total,
+            createdAt: dbJob.created_at ? new Date(dbJob.created_at).getTime() : Date.now(),
+            completedAt: dbJob.completed_at ? new Date(dbJob.completed_at).getTime() : null,
+            expiresAt: dbJob.expires_at ? new Date(dbJob.expires_at).getTime() : null,
+            fileName: dbJob.file_name,
+            rawFileName: dbJob.raw_file_name,
+            rawReady: Boolean(dbJob.raw_ready),
+            partialReady: Boolean(dbJob.partial_ready),
+            leadsFound: dbJob.leads_found,
+            error: dbJob.error,
+            userMessage: dbJob.user_message,
+            result: dbJob.result_json,
+            downloads: 0,
+          };
+        }
+      }
       return job ? json(response, 200, publicJob(job)) : json(response, 404, { error: 'Run not found.' });
     }
     json(response, 404, { error: 'Not found.' });
@@ -1104,9 +1198,29 @@ async function clearOrphanRuns() {
   try { await fs.rmdir(JOB_ROOT); } catch { }
   try { await fs.rmdir(path.dirname(JOB_ROOT)); } catch { }
 }
-clearOrphanRuns().then(() => {
+
+async function startServer() {
+  try {
+    await db.initDb();
+    console.log('[db] PostgreSQL pulse_db initialized and TTL cleanup worker active.');
+  } catch (error) {
+    console.error('[db init failed]', error);
+  }
+  try {
+    await clearOrphanRuns();
+  } catch (error) {
+    console.error('[orphan cleanup error]', error);
+  }
   server.listen(PORT, process.env.HOST || '0.0.0.0', () => console.log(`Lead finder ready on port ${PORT}`));
-}).catch(error => {
-  console.error('[startup cleanup]', error);
-  server.listen(PORT, process.env.HOST || '0.0.0.0', () => console.log(`Lead finder ready on port ${PORT}`));
+}
+
+process.on('SIGTERM', async () => {
+  await db.closeDb();
+  process.exit(0);
 });
+process.on('SIGINT', async () => {
+  await db.closeDb();
+  process.exit(0);
+});
+
+startServer();
